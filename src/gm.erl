@@ -395,9 +395,8 @@
 
 -define(GROUP_TABLE, gm_group).
 -define(MAX_BUFFER_SIZE, 100000000). %% 100MB
--define(HIBERNATE_AFTER_MIN, 1000).
--define(DESIRED_HIBERNATE, 10000).
 -define(BROADCAST_TIMER, 25).
+-define(GC_AFTER_NUMBER_OF_ACTIVITIES, 1000 / ?BROADCAST_TIMER).
 -define(VERSION_START, 0).
 -define(SETS, ordsets).
 -define(DICT, orddict).
@@ -416,6 +415,7 @@
           broadcast_buffer,
           broadcast_buffer_sz,
           broadcast_timer,
+          activities_count,
           txn_executor,
           shutting_down
         }).
@@ -551,6 +551,7 @@ init([GroupName, Module, Args, TxnFun]) ->
                   broadcast_buffer    = [],
                   broadcast_buffer_sz = 0,
                   broadcast_timer     = undefined,
+                  activities_count    = 0,
                   txn_executor        = TxnFun,
                   shutting_down       = false }}.
 
@@ -868,10 +869,10 @@ handle_msg({activity, Left, Activity},
         State1 = State #state { members_state = MembersState1,
                                 confirms      = Confirms1 },
         Activity3 = activity_finalise(Activity1),
-        ok = maybe_send_activity(Activity3, State1),
-        {Result, State2} = maybe_erase_aliases(State1, View),
+        {ok, State2} = maybe_send_activity(Activity3, State1),
+        {Result, State3} = maybe_erase_aliases(State2, View),
         if_callback_success(
-          Result, fun activity_true/3, fun activity_false/3, Activity3, State2)
+          Result, fun activity_true/3, fun activity_false/3, Activity3, State3)
     catch
         lost_membership ->
             {{stop, shutdown}, State}
@@ -948,17 +949,26 @@ flush_broadcast_buffer(State = #state { self             = Self,
     [{PubCount, _Msg}|_] = Buffer, %% ASSERTION match on PubCount
     Pubs = lists:reverse(Buffer),
     Activity = activity_cons(Self, Pubs, [], activity_nil()),
-    ok = maybe_send_activity(activity_finalise(Activity), State),
+    {ok, State1} = maybe_send_activity(activity_finalise(Activity), State),
     MembersState1 = with_member(
                       fun (Member = #member { pending_ack = PA }) ->
                               PA1 = queue:join(PA, queue:from_list(Pubs)),
                               Member #member { pending_ack = PA1,
                                                last_pub = PubCount }
                       end, Self, MembersState),
-    State #state { members_state       = MembersState1,
-                   broadcast_buffer    = [],
-                   broadcast_buffer_sz = 0}.
+    State1 #state { members_state       = MembersState1,
+                    broadcast_buffer    = [],
+                    broadcast_buffer_sz = 0 }.
 
+maybe_garbage_collect(State = #state {activities_count = ActivitiesCount}) ->
+    if
+        ActivitiesCount >= ?GC_AFTER_NUMBER_OF_ACTIVITIES ->
+            rabbit_log:info("GM GC GARBAGE COLLECT ~p", [self()]),
+            garbage_collect(),
+            State #state { activities_count = 0 };
+        true ->
+            State #state { activities_count = ActivitiesCount + 1 }
+    end.
 
 %% ---------------------------------------------------------------------------
 %% View construction and inspection
@@ -1407,12 +1417,14 @@ activity_cons(Sender, Pubs, Acks, Tail) -> queue:in({Sender, Pubs, Acks}, Tail).
 
 activity_finalise(Activity) -> queue:to_list(Activity).
 
-maybe_send_activity([], _State) ->
-    ok;
-maybe_send_activity(Activity, #state { self  = Self,
-                                       right = {Right, _MRefR},
-                                       view  = View }) ->
-    send_right(Right, View, {activity, Self, Activity}).
+maybe_send_activity([], State) ->
+    {ok, State};
+maybe_send_activity(Activity, State = #state { self  = Self,
+                                               right = {Right, _MRefR},
+                                               view  = View }) ->
+    State1 = maybe_garbage_collect(State),
+    Ret = send_right(Right, View, {activity, Self, Activity}),
+    {Ret, State1}.
 
 send_right(Right, View, Msg) ->
     ok = neighbour_cast(Right, {?TAG, view_version(View), Msg}).
