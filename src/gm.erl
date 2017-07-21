@@ -889,7 +889,6 @@ handle_msg({activity, Left, Activity},
 handle_msg({activity, _NotLeft, _Activity}, State) ->
     {ok, State}.
 
-
 noreply(State) ->
     {noreply, ensure_broadcast_timer(State), flush_timeout(State)}.
 
@@ -903,22 +902,33 @@ ensure_broadcast_timer(State = #state { broadcast_buffer = [],
                                         broadcast_timer  = undefined }) ->
     State;
 ensure_broadcast_timer(State = #state { broadcast_buffer = [],
-                                        broadcast_timer  = BroadcastTRef,
-                                        forced_gc_timer  = GCTRef }) ->
+                                        broadcast_timer  = BroadcastTRef }) ->
     _ = erlang:cancel_timer(BroadcastTRef),
+    State1 = cancel_gc_timer(State),
+    State1 #state { broadcast_timer = undefined };
+ensure_broadcast_timer(State = #state { broadcast_timer = undefined }) ->
+    BroadcastTRef = erlang:send_after(?BROADCAST_TIMER, self(), flush),
+    State1 = ensure_gc_timer(State),
+    State1 #state { broadcast_timer = BroadcastTRef };
+ensure_broadcast_timer(State) ->
+    State.
+
+cancel_gc_timer(State = #state{ forced_gc_timer = GCTRef }) ->
     case GCTRef of
         undefined -> ok;
         _         -> {ok, cancel} = timer:cancel(GCTRef)
     end,
-    State #state { broadcast_timer = undefined,
-                   forced_gc_timer = undefined };
-ensure_broadcast_timer(State = #state { broadcast_timer = undefined }) ->
-    BroadcastTRef = erlang:send_after(?BROADCAST_TIMER, self(), flush),
-    {ok, GCTRef} = timer:send_interval(?FORCED_GC_TIMER, self(), force_gc),
-    State #state { broadcast_timer = BroadcastTRef,
-                   forced_gc_timer = GCTRef };
-ensure_broadcast_timer(State) ->
-    State.
+    State#state{ forced_gc_timer = undefined }.
+
+ensure_gc_timer(State = #state{ forced_gc_timer = GCTRef0 }) ->
+    GCTRef1 = case GCTRef0 of
+                  undefined ->
+                      {ok, NewGCTRef} = timer:send_interval(?FORCED_GC_TIMER,
+                                                            self(), force_gc),
+                      NewGCTRef;
+                  GCTRef -> GCTRef
+              end,
+    State#state{ forced_gc_timer = GCTRef1 }.
 
 internal_broadcast(Msg, SizeHint,
                    State = #state { self                = Self,
