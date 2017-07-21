@@ -508,7 +508,8 @@ table_definitions() ->
     [{Name, [?TABLE_MATCH | Attributes]}].
 
 start_link(GroupName, Module, Args, TxnFun) ->
-    gen_server:start_link(?MODULE, [GroupName, Module, Args, TxnFun], []).
+    gen_server:start_link(?MODULE, [GroupName, Module, Args, TxnFun],
+                          [{spawn_opt, [{fullsweep_after, 0}]}]).
 
 leave(Server) ->
     gen_server:cast(Server, leave).
